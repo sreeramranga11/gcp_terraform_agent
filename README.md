@@ -2,24 +2,21 @@
 
 ## Overview
 
-This project is an **agentic DevOps assistant** that automates GCP infrastructure changes using Jira tickets as the trigger. When a user creates a Jira ticket, the agent:
-- Picks up the ticket (if in "To Do" status)
-- Moves it to **In Progress**
-- Proposes Terraform changes using Vertex AI
-- Creates a new branch and PR in GitHub
-- Moves the ticket to **In Review** and comments with a summary and PR link
-- Logs all actions to **Google Cloud Logging** for full auditability
+This project is an **agentic DevOps assistant** that automates GCP infrastructure changes using **Jira tickets as the sole trigger**. The system is designed for a human-in-the-loop, auditable workflow where:
+- Creating a Jira ticket in "To Do" triggers the agent to propose and PR Terraform changes.
+- Creating a **sub-task** for a ticket in "In Review" triggers a follow-up agentic workflow for that parent ticket.
+- All actions (status transitions, PRs, summaries) are logged to **Google Cloud Logging**.
 
-No manual chat or approval is needed—**the entire flow is driven by Jira tickets**.
+**No manual chat or web UI is used in production. All workflows are driven by Jira.**
 
 ---
 
 ## Architecture
 
 - **Backend:** FastAPI app that listens for Jira webhooks, runs the agentic workflow, manages GitHub PRs, and logs to GCP Logging.
-- **Jira:** Used as the user interface for requesting and tracking infrastructure changes.
+- **Jira:** The only user interface for requesting and tracking infrastructure changes.
 - **GitHub:** Stores Terraform code and receives automated PRs.
-- **Vertex AI:** Generates Terraform code changes from natural language.
+- **Vertex AI:** Generates Terraform code changes from natural language (using Gemini 2.5 Pro).
 - **GCP Logging:** Stores all logs for traceability and debugging.
 
 ---
@@ -37,7 +34,6 @@ No manual chat or approval is needed—**the entire flow is driven by Jira ticke
 - Click **Create a Webhook**
 - **URL:** Use your public FastAPI endpoint (see ngrok below for local dev)
 - **Events:** Select **Issue Created**
-- **Filters:** (Recommended) Filter by project and status (e.g., only "To Do")
 - **Status:** Enabled
 
 #### c. **Jira Permissions**
@@ -79,6 +75,7 @@ JIRA_URL=https://yourdomain.atlassian.net
 JIRA_USER=your-email@example.com
 JIRA_API_TOKEN=your-jira-api-token
 GOOGLE_APPLICATION_CREDENTIALS=/path/to/your-service-account-key.json
+JIRA_PROJECT_KEY=your-project-id
 ```
 
 ---
@@ -93,8 +90,9 @@ pip install -r requirements.txt
 
 ---
 
-## Usage
+## Agentic Usage (Jira-Driven Only)
 
+### **A. Propose a New Change**
 1. **Create a Jira ticket** in the configured project, in the "To Do" status, describing your infrastructure change.
 2. The agent will:
    - Move the ticket to **In Progress**
@@ -102,12 +100,39 @@ pip install -r requirements.txt
    - Open a PR in GitHub
    - Move the ticket to **In Review** and comment with a summary and PR link
    - Log all actions to GCP Logging
-3. Review the PR in GitHub and the summary/comment in Jira.
+
+### **B. Propose a Follow-up Change (for tickets already In Review)**
+1. **Create a sub-task** for any ticket that is currently in "In Review".
+2. The agent will:
+   - Move the parent ticket to **In Progress**
+   - Use the sub-task's summary/description as the new prompt
+   - Propose and commit Terraform changes in a new branch
+   - Open a PR in GitHub
+   - Move the parent ticket back to **In Review** and comment with a summary and PR link
+   - Log all actions to GCP Logging
+
+**Note:** Only sub-tasks can trigger follow-up changes for tickets in "In Review". Comments and other ticket types are ignored.
+
+---
+
+## Robustness & Debugging
+
+- **Status Checks:** Before processing, the backend always fetches the latest status of the ticket (and parent, for sub-tasks) from Jira. Tickets are only processed if they are still in "To Do" (for normal tickets) or the parent is in "In Review" (for sub-tasks). Deleted or completed tickets are ignored.
+- **Debug Endpoint:**
+  - `POST /debug/clear_cache` — Clears all in-memory state (pending user Terraform changes and context) without restarting the backend.
+- **Logs:** All actions are logged to GCP Logging for traceability and debugging.
+
+---
+
+## Technical Highlights
+- **Vertex AI Gemini 2.5 Pro** is used for all LLM tasks.
+- **Patch-by-block** logic ensures robust Terraform file updates.
+- **All workflows are triggered and managed via Jira tickets and sub-tasks.**
+- **No manual chat or web UI is used in production.**
 
 ---
 
 ## Troubleshooting
-
 - **Permission Denied for Logging:**
   - Ensure your service account has `roles/logging.logWriter`.
   - Make sure `GOOGLE_APPLICATION_CREDENTIALS` is set and points to a valid key.
@@ -118,14 +143,9 @@ pip install -r requirements.txt
   - Make sure ngrok is running and you are using the HTTPS forwarding URL in Jira.
 - **No PR Created:**
   - Check GCP Logging for errors.
-  - Ensure the ticket is created in the "To Do" status.
-
----
-
-## Notes
-- The agent only processes tickets in the "To Do" status.
-- All actions are logged to GCP Logging for traceability.
-- You can further customize the workflow by editing `backend/main.py`.
+  - Ensure the ticket is created in the "To Do" status or the parent is in "In Review" for sub-tasks.
+- **Old/Deleted Tickets Processed:**
+  - The backend always checks the latest status before processing, but you can also clear the in-memory cache with the debug endpoint or by restarting the backend.
 
 ---
 

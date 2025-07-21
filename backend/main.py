@@ -14,6 +14,8 @@ import re
 import json
 import requests
 from google.cloud import logging as gcp_logging
+from apscheduler.schedulers.background import BackgroundScheduler
+import threading
 
 # Load environment variables from .env file
 load_dotenv()
@@ -32,10 +34,11 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 REGION = os.getenv("REGION")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
-DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "main")
-JIRA_URL = os.getenv("JIRA_URL")  # e.g., https://yourdomain.atlassian.net
-JIRA_USER = os.getenv("JIRA_USER")  # email or username
+DEFAULT_BRANCH = "main"
+JIRA_URL = os.getenv("JIRA_URL")
+JIRA_USER = os.getenv("JIRA_USER")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
 
 # In-memory store for generated Terraform change and context per user
 user_terraform_change = {}
@@ -72,7 +75,8 @@ def fetch_terraform_files():
 
 def call_vertex_ai(prompt: str) -> str:
     vertexai.init(project=PROJECT_ID, location=REGION)
-    model = GenerativeModel("gemini-2.0-flash-lite-001")
+    # Upgraded to Gemini 2.5 Pro (as of July 2024)
+    model = GenerativeModel("gemini-2.5-pro")
     response = model.generate_content(prompt)
     return response.text
 
@@ -449,6 +453,80 @@ def jira_comment_issue(issue_key, comment):
     print(f"[JIRA] Comment response: {resp.status_code} {resp.text}")
     return resp.status_code == 201
 
+def get_existing_suggestions():
+    """
+    Fetch all existing suggestion issues in the Suggestions column from Jira.
+    Returns a set of suggestion summaries (for deduplication).
+    """
+    url = f"{JIRA_URL}/rest/api/3/search"
+    auth = (JIRA_USER, JIRA_API_TOKEN)
+    headers = {"Accept": "application/json"}
+    jql = f'status = "Suggestions" AND project = {JIRA_PROJECT_KEY}'
+    params = {"jql": jql, "fields": "summary", "maxResults": 100}
+    resp = requests.get(url, auth=auth, headers=headers, params=params)
+    if resp.status_code != 200:
+        print(f"[JIRA] Failed to fetch existing suggestions: {resp.text}")
+        return set()
+    issues = resp.json().get("issues", [])
+    return set(issue["fields"]["summary"].strip() for issue in issues)
+
+def create_jira_suggestion_issue(suggestion):
+    url = f"{JIRA_URL}/rest/api/3/issue"
+    auth = (JIRA_USER, JIRA_API_TOKEN)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    data = {
+        "fields": {
+            "project": {"key": JIRA_PROJECT_KEY},
+            "summary": suggestion[:100],
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": suggestion
+                            }
+                        ]
+                    }
+                ]
+            },
+            "issuetype": {"name": "Task"},  # Or "Suggestion" if you have a custom type
+            "labels": ["suggestion"]
+        }
+    }
+    resp = requests.post(url, auth=auth, headers=headers, json=data)
+    print(f"[JIRA] Created suggestion issue: {resp.status_code} {resp.text}")
+    if resp.status_code == 201:
+        issue_key = resp.json().get("key")
+        if issue_key:
+            jira_transition_issue(issue_key, "Suggestions")
+
+def generate_and_post_suggestions():
+    print("[SUGGESTIONS] Running daily suggestion generation...")
+    files = fetch_terraform_files()
+    prompt = (
+        "You are an expert code reviewer. Suggest 2-3 improvements for this Terraform codebase. "
+        "Be specific and actionable. Do not repeat previous suggestions.\n\n"
+        + "\n\n".join([f"File: {f['path']}\n{f['content']}" for f in files])
+    )
+    suggestions = call_vertex_ai(prompt)
+    print(f"[SUGGESTIONS] Suggestions generated:\n{suggestions}")
+    existing = get_existing_suggestions()
+    for suggestion in suggestions.split("\n"):
+        suggestion = suggestion.strip("-•1234567890. ").strip()
+        if suggestion and suggestion not in existing:
+            create_jira_suggestion_issue(suggestion)
+
+# Start the scheduler in a background thread after FastAPI app is created
+scheduler = BackgroundScheduler()
+scheduler.add_job(generate_and_post_suggestions, 'cron', hour=3)  # Runs daily at 3am
+scheduler_thread = threading.Thread(target=scheduler.start)
+scheduler_thread.daemon = True
+scheduler_thread.start()
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -554,134 +632,265 @@ async def jira_webhook(request: Request):
     import logging
     logger = logging.getLogger("jira-webhook")
     payload = await request.json()
-    logger.info({"event": "webhook_received", "payload": payload})
+    headers = dict(request.headers)
+    logger.info({"event": "webhook_received", "payload": payload, "headers": headers})
     print("[JIRA WEBHOOK] Received payload:", json.dumps(payload, indent=2))
+    print(f"[JIRA WEBHOOK] Headers: {headers}")
 
-    # 1. Parse event type
-    event_type = request.headers.get("X-Atlassian-Webhook-Identifier") or payload.get("webhookEvent")
+    event_type = payload.get("webhookEvent")
     logger.info({"event": "event_type_parsed", "event_type": event_type})
     print(f"[JIRA WEBHOOK] Event type: {event_type}")
 
-    # 2. Only process issue_created events
-    if payload.get("webhookEvent") != "jira:issue_created":
-        logger.info({"event": "ignored_event", "reason": "not issue_created", "event_type": payload.get("webhookEvent")})
+    if event_type == "jira:issue_created":
+        issue = payload.get("issue", {})
+        key = issue.get("key")
+        fields = issue.get("fields", {})
+        summary = fields.get("summary")
+        description = fields.get("description")
+        reporter = fields.get("reporter", {}).get("displayName")
+        status_name = fields.get("status", {}).get("name", "")
+        issue_type = fields.get("issuetype", {}).get("name", "")
+        parent = fields.get("parent")
+        logger.info({"event": "ticket_info_extracted", "key": key, "summary": summary, "status": status_name, "reporter": reporter, "issue_type": issue_type, "parent": parent})
+        print(f"[JIRA WEBHOOK] Issue key: {key}")
+        print(f"[JIRA WEBHOOK] Summary: {summary}")
+        print(f"[JIRA WEBHOOK] Description: {description}")
+        print(f"[JIRA WEBHOOK] Reporter: {reporter}")
+        print(f"[JIRA WEBHOOK] Issue status (raw): '{status_name}'")
+        print(f"[JIRA WEBHOOK] Issue type: {issue_type}")
+        # Always fetch latest ticket status from Jira
+        url = f"{JIRA_URL}/rest/api/3/issue/{key}"
+        auth = (JIRA_USER, JIRA_API_TOKEN)
+        headers_jira = {"Accept": "application/json"}
+        resp = requests.get(url, auth=auth, headers=headers_jira)
+        if resp.status_code != 200:
+            print(f"[JIRA WEBHOOK] Ticket {key} no longer exists. Skipping.")
+            return {"status": "ignored", "reason": "ticket deleted"}
+        latest_fields = resp.json().get("fields", {})
+        latest_status = latest_fields.get("status", {}).get("name", "")
+        print(f"[JIRA WEBHOOK] Latest status for {key}: {latest_status}")
+        # If this is a sub-task, check parent status
+        if issue_type.lower() == "sub-task" and parent:
+            parent_key = parent.get("key")
+            # Fetch parent issue to get its status
+            url = f"{JIRA_URL}/rest/api/3/issue/{parent_key}"
+            resp = requests.get(url, auth=auth, headers=headers_jira)
+            if resp.status_code != 200:
+                print(f"[JIRA WEBHOOK] Parent ticket {parent_key} no longer exists. Skipping.")
+                return {"status": "ignored", "reason": "parent ticket deleted"}
+            parent_fields = resp.json().get("fields", {})
+            parent_status = parent_fields.get("status", {}).get("name", "")
+            print(f"[JIRA WEBHOOK] Parent {parent_key} status: {parent_status}")
+            if parent_status.strip().lower() == "in review":
+                # Move parent to In Progress
+                jira_transition_issue(parent_key, "In Progress")
+                user_prompt = summary or ""
+                if description:
+                    user_prompt += f"\n{description}"
+                print(f"[JIRA WEBHOOK] Using user_prompt from sub-task: {user_prompt}")
+                files = fetch_terraform_files()
+                logger.info({"event": "files_fetched", "key": parent_key, "files": [f['path'] for f in files]})
+                print(f"[JIRA WEBHOOK] Files fetched for context: {[f['path'] for f in files]}")
+                response = initial_summary_and_diff(user_prompt, files)
+                logger.info({"event": "model_response", "key": parent_key, "response": response})
+                print(f"[JIRA WEBHOOK] Model response (block changes):\n{response}")
+                user_terraform_change[parent_key] = response
+                user_terraform_context[parent_key] = files
+                # --- Apply changes and create PR (same as /approve logic) ---
+                block_changes = parse_block_changes(response)
+                if not block_changes:
+                    logger.info({"event": "no_block_changes", "key": parent_key})
+                    print("[JIRA WEBHOOK] No block changes parsed from model response.")
+                    return {"status": "no_changes", "reason": "No block changes found in model response."}
+                updated_files = apply_block_changes(files, block_changes)
+                changed = False
+                for f in files:
+                    orig = f['content']
+                    updated = updated_files.get(f['path'], orig)
+                    if orig != updated:
+                        changed = True
+                        break
+                if not changed:
+                    logger.info({"event": "no_actual_changes", "key": parent_key})
+                    print("[JIRA WEBHOOK] No actual file changes detected. Not creating PR.")
+                    return {"status": "no_changes", "reason": "No files were changed. The block changes could not be applied or resulted in no changes."}
+                print(f"[JIRA WEBHOOK] Preparing to push changes to GitHub...")
+                g = Github(GITHUB_TOKEN)
+                repo = g.get_repo(GITHUB_REPO)
+                base = repo.get_branch(DEFAULT_BRANCH)
+                branch_name = f"infra-change-{parent_key}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+                repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
+                commit_message = f"Apply infrastructure change for Jira ticket {parent_key} via chatbot (from sub-task {key})"
+                for path, content in updated_files.items():
+                    print(f"[JIRA WEBHOOK] Committing file: {path}")
+                    try:
+                        f = repo.get_contents(path, ref=branch_name)
+                        repo.update_file(path, commit_message, content, f.sha, branch=branch_name)
+                    except Exception:
+                        repo.create_file(path, commit_message, content, branch=branch_name)
+                pr = repo.create_pull(
+                    title=f"Infra change for Jira ticket {parent_key} (from sub-task {key})",
+                    body=f"Automated PR from GCP Terraform Chatbot for Jira ticket {parent_key} (from sub-task {key})",
+                    head=branch_name,
+                    base=DEFAULT_BRANCH
+                )
+                logger.info({"event": "pr_created", "key": parent_key, "pr_url": pr.html_url, "branch": branch_name})
+                print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
+                # Move parent back to In Review and comment with summary and PR link
+                summary_text = None
+                try:
+                    prompt = (
+                        f"You are an expert DevOps assistant. Here is a set of Terraform block changes, each with a file and block name. "
+                        f"Summarize the overall infrastructure change in 1-2 sentences, focusing on what is being added, removed, or modified. "
+                        f"Do NOT include code, only a human-readable summary.\n\n"
+                        f"{response}"
+                    )
+                    summary_text = call_vertex_ai(prompt)
+                    logger.info({"event": "summary_generated", "key": parent_key, "summary": summary_text})
+                    print(f"[JIRA WEBHOOK] Summary for comment: {summary_text}")
+                except Exception as e:
+                    logger.error({"event": "summary_error", "key": parent_key, "error": str(e)})
+                    print(f"[JIRA WEBHOOK] Error getting summary: {e}")
+                    summary_text = "(Could not generate summary)"
+                jira_transition_issue(parent_key, "In Review")
+                comment = (
+                    f"Automated infrastructure change proposed for this ticket (from sub-task {key}).\n\n"
+                    f"**Jira Ticket:** {parent_key} (from sub-task {key})\n\n"
+                    f"**Summary of changes:**\n{summary_text}\n\n"
+                    f"**Review the proposed changes in this PR:** {pr.html_url}\n\n"
+                    f"If you have feedback or require changes, please create another sub-task."
+                )
+                jira_comment_issue(parent_key, comment)
+                logger.info({"event": "in_review_transitioned_and_commented", "key": parent_key})
+                return {
+                    "status": "pr_created_from_subtask",
+                    "pr_url": pr.html_url,
+                    "issue_key": parent_key,
+                    "summary": summary,
+                    "description": description,
+                    "reporter": reporter
+                }
+            else:
+                logger.info({"event": "ignored_subtask_parent_status", "key": key, "parent_key": parent_key, "parent_status": parent_status})
+                print(f"[JIRA WEBHOOK] Parent {parent_key} is not in 'In Review'. Skipping sub-task workflow.")
+                return {"status": "ignored", "reason": "parent not in In Review"}
+        # Otherwise, fall through to original logic for normal tickets
+        if latest_status.strip().lower() != "to do":
+            logger.info({"event": "ignored_status", "key": key, "status": latest_status})
+            print(f"[JIRA WEBHOOK] Ticket {key} is no longer in 'To Do' (now '{latest_status}'). Skipping agentic workflow.")
+            return {"status": "ignored", "reason": f"not in To Do (now {latest_status})"}
+
+        try:
+            logger.info({"event": "workflow_triggered", "key": key})
+            # Move ticket to In Progress
+            jira_transition_issue(key, "In Progress")
+
+            user_prompt = summary or ""
+            if description:
+                user_prompt += f"\n{description}"
+            print(f"[JIRA WEBHOOK] Using user_prompt: {user_prompt}")
+            files = fetch_terraform_files()
+            logger.info({"event": "files_fetched", "key": key, "files": [f['path'] for f in files]})
+            print(f"[JIRA WEBHOOK] Files fetched for context: {[f['path'] for f in files]}")
+            response = initial_summary_and_diff(user_prompt, files)
+            logger.info({"event": "model_response", "key": key, "response": response})
+            print(f"[JIRA WEBHOOK] Model response (block changes):\n{response}")
+            user_terraform_change[key] = response
+            user_terraform_context[key] = files
+
+            # --- Apply changes and create PR (same as /approve logic) ---
+            block_changes = parse_block_changes(response)
+            if not block_changes:
+                logger.info({"event": "no_block_changes", "key": key})
+                print("[JIRA WEBHOOK] No block changes parsed from model response.")
+                return {"status": "no_changes", "reason": "No block changes found in model response."}
+            updated_files = apply_block_changes(files, block_changes)
+            changed = False
+            for f in files:
+                orig = f['content']
+                updated = updated_files.get(f['path'], orig)
+                if orig != updated:
+                    changed = True
+                    break
+            if not changed:
+                logger.info({"event": "no_actual_changes", "key": key})
+                print("[JIRA WEBHOOK] No actual file changes detected. Not creating PR.")
+                return {"status": "no_changes", "reason": "No files were changed. The block changes could not be applied or resulted in no changes."}
+            print(f"[JIRA WEBHOOK] Preparing to push changes to GitHub...")
+            g = Github(GITHUB_TOKEN)
+            repo = g.get_repo(GITHUB_REPO)
+            base = repo.get_branch(DEFAULT_BRANCH)
+            branch_name = f"infra-change-{key}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
+            commit_message = f"Apply infrastructure change for Jira ticket {key} via chatbot"
+            for path, content in updated_files.items():
+                print(f"[JIRA WEBHOOK] Committing file: {path}")
+                try:
+                    f = repo.get_contents(path, ref=branch_name)
+                    repo.update_file(path, commit_message, content, f.sha, branch=branch_name)
+                except Exception:
+                    repo.create_file(path, commit_message, content, branch=branch_name)
+            pr = repo.create_pull(
+                title=f"Infra change for Jira ticket {key}",
+                body="Automated PR from GCP Terraform Chatbot",
+                head=branch_name,
+                base=DEFAULT_BRANCH
+            )
+            logger.info({"event": "pr_created", "key": key, "pr_url": pr.html_url, "branch": branch_name})
+            print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
+
+            # Move ticket to In Review and comment with summary and PR link
+            summary_text = None
+            try:
+                prompt = (
+                    f"You are an expert DevOps assistant. Here is a set of Terraform block changes, each with a file and block name. "
+                    f"Summarize the overall infrastructure change in 1-2 sentences, focusing on what is being added, removed, or modified. "
+                    f"Do NOT include code, only a human-readable summary.\n\n"
+                    f"{response}"
+                )
+                summary_text = call_vertex_ai(prompt)
+                logger.info({"event": "summary_generated", "key": key, "summary": summary_text})
+                print(f"[JIRA WEBHOOK] Summary for comment: {summary_text}")
+            except Exception as e:
+                logger.error({"event": "summary_error", "key": key, "error": str(e)})
+                print(f"[JIRA WEBHOOK] Error getting summary: {e}")
+                summary_text = "(Could not generate summary)"
+            jira_transition_issue(key, "In Review")
+            comment = (
+                f"Automated infrastructure change proposed for this ticket.\n\n"
+                f"**Jira Ticket:** {key} - {summary}\n\n"
+                f"**Summary of changes:**\n{summary_text}\n\n"
+                f"**Review the proposed changes in this PR:** {pr.html_url}\n\n"
+                f"If you have feedback or require changes, please comment here."
+            )
+            jira_comment_issue(key, comment)
+            logger.info({"event": "in_review_transitioned_and_commented", "key": key})
+
+            return {
+                "status": "pr_created",
+                "pr_url": pr.html_url,
+                "issue_key": key,
+                "summary": summary,
+                "description": description,
+                "reporter": reporter
+            }
+        except Exception as e:
+            logger.error({"event": "error", "key": key, "error": str(e)})
+            print(f"[JIRA WEBHOOK] Error in agentic workflow: {e}")
+            return {"status": "error", "error": str(e)}
+    else:
+        logger.info({"event": "ignored_event", "reason": "not issue_created", "event_type": event_type})
         print("[JIRA WEBHOOK] Ignoring non-issue_created event.")
         return {"status": "ignored", "reason": "not issue_created"}
 
-    # 3. Extract ticket info
-    issue = payload.get("issue", {})
-    key = issue.get("key")
-    fields = issue.get("fields", {})
-    summary = fields.get("summary")
-    description = fields.get("description")
-    reporter = fields.get("reporter", {}).get("displayName")
-    status_name = fields.get("status", {}).get("name", "")
-    logger.info({"event": "ticket_info_extracted", "key": key, "summary": summary, "status": status_name, "reporter": reporter})
-    print(f"[JIRA WEBHOOK] Issue key: {key}")
-    print(f"[JIRA WEBHOOK] Summary: {summary}")
-    print(f"[JIRA WEBHOOK] Description: {description}")
-    print(f"[JIRA WEBHOOK] Reporter: {reporter}")
-    print(f"[JIRA WEBHOOK] Issue status (raw): '{status_name}'")
-    if status_name.strip().lower() != "to do":
-        logger.info({"event": "ignored_status", "key": key, "status": status_name})
-        print("[JIRA WEBHOOK] Ticket is not in 'To Do' status. Skipping agentic workflow.")
-        return {"status": "ignored", "reason": "not in To Do"}
+# Debug endpoint to clear in-memory cache
+@app.post("/debug/clear_cache")
+def clear_cache():
+    user_terraform_change.clear()
+    user_terraform_context.clear()
+    return {"status": "cleared"}
 
-    try:
-        logger.info({"event": "workflow_triggered", "key": key})
-        # Move ticket to In Progress
-        jira_transition_issue(key, "In Progress")
-
-        user_prompt = summary or ""
-        if description:
-            user_prompt += f"\n{description}"
-        print(f"[JIRA WEBHOOK] Using user_prompt: {user_prompt}")
-        files = fetch_terraform_files()
-        logger.info({"event": "files_fetched", "key": key, "files": [f['path'] for f in files]})
-        print(f"[JIRA WEBHOOK] Files fetched for context: {[f['path'] for f in files]}")
-        response = initial_summary_and_diff(user_prompt, files)
-        logger.info({"event": "model_response", "key": key, "response": response})
-        print(f"[JIRA WEBHOOK] Model response (block changes):\n{response}")
-        user_terraform_change[key] = response
-        user_terraform_context[key] = files
-
-        # --- Apply changes and create PR (same as /approve logic) ---
-        block_changes = parse_block_changes(response)
-        if not block_changes:
-            logger.info({"event": "no_block_changes", "key": key})
-            print("[JIRA WEBHOOK] No block changes parsed from model response.")
-            return {"status": "no_changes", "reason": "No block changes found in model response."}
-        updated_files = apply_block_changes(files, block_changes)
-        changed = False
-        for f in files:
-            orig = f['content']
-            updated = updated_files.get(f['path'], orig)
-            if orig != updated:
-                changed = True
-                break
-        if not changed:
-            logger.info({"event": "no_actual_changes", "key": key})
-            print("[JIRA WEBHOOK] No actual file changes detected. Not creating PR.")
-            return {"status": "no_changes", "reason": "No files were changed. The block changes could not be applied or resulted in no changes."}
-        print(f"[JIRA WEBHOOK] Preparing to push changes to GitHub...")
-        g = Github(GITHUB_TOKEN)
-        repo = g.get_repo(GITHUB_REPO)
-        base = repo.get_branch(DEFAULT_BRANCH)
-        branch_name = f"infra-change-{key}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-        repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
-        commit_message = f"Apply infrastructure change for Jira ticket {key} via chatbot"
-        for path, content in updated_files.items():
-            print(f"[JIRA WEBHOOK] Committing file: {path}")
-            try:
-                f = repo.get_contents(path, ref=branch_name)
-                repo.update_file(path, commit_message, content, f.sha, branch=branch_name)
-            except Exception:
-                repo.create_file(path, commit_message, content, branch=branch_name)
-        pr = repo.create_pull(
-            title=f"Infra change for Jira ticket {key}",
-            body=f"Automated PR from GCP Terraform Chatbot for Jira ticket {key}",
-            head=branch_name,
-            base=DEFAULT_BRANCH
-        )
-        logger.info({"event": "pr_created", "key": key, "pr_url": pr.html_url, "branch": branch_name})
-        print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
-
-        # Move ticket to In Review and comment with summary and PR link
-        summary_text = None
-        try:
-            prompt = (
-                f"You are an expert DevOps assistant. Here is a set of Terraform block changes, each with a file and block name. "
-                f"Summarize the overall infrastructure change in 1-2 sentences, focusing on what is being added, removed, or modified. "
-                f"Do NOT include code, only a human-readable summary.\n\n"
-                f"{response}"
-            )
-            summary_text = call_vertex_ai(prompt)
-            logger.info({"event": "summary_generated", "key": key, "summary": summary_text})
-            print(f"[JIRA WEBHOOK] Summary for comment: {summary_text}")
-        except Exception as e:
-            logger.error({"event": "summary_error", "key": key, "error": str(e)})
-            print(f"[JIRA WEBHOOK] Error getting summary: {e}")
-            summary_text = "(Could not generate summary)"
-        jira_transition_issue(key, "In Review")
-        comment = (
-            f"Automated infrastructure change proposed for this ticket.\n\n"
-            f"**Jira Ticket:** {key} - {summary}\n\n"
-            f"**Summary of changes:**\n{summary_text}\n\n"
-            f"**Review the proposed changes in this PR:** {pr.html_url}\n\n"
-            f"If you have feedback or require changes, please comment here."
-        )
-        jira_comment_issue(key, comment)
-        logger.info({"event": "in_review_transitioned_and_commented", "key": key})
-
-        return {
-            "status": "pr_created",
-            "pr_url": pr.html_url,
-            "issue_key": key,
-            "summary": summary,
-            "description": description,
-            "reporter": reporter
-        }
-    except Exception as e:
-        logger.error({"event": "error", "key": key, "error": str(e)})
-        print(f"[JIRA WEBHOOK] Error in agentic workflow: {e}")
-        return {"status": "error", "error": str(e)}
+@app.post("/suggestions/generate")
+def manual_generate_suggestions():
+    generate_and_post_suggestions()
+    return {"status": "manual suggestion generation triggered"}
