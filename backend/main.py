@@ -783,7 +783,7 @@ async def jira_webhook(request: Request):
                     f"Automated infrastructure change proposed for this ticket (from sub-task {key}).\n\n"
                     f"**Jira Ticket:** {parent_key} (from sub-task {key})\n\n"
                     f"**Summary of changes:**\n{summary_text}\n\n"
-                    f"**Review the proposed changes in this PR:** {pr.html_url}\n\n"
+                    f"**Review the proposed changes in this PR:**\n{pr.html_url}\n\n"
                     f"If you have feedback or require changes, please create another sub-task."
                 )
                 jira_comment_issue(parent_key, comment)
@@ -893,7 +893,7 @@ async def jira_webhook(request: Request):
                 f"Automated infrastructure change proposed for this ticket.\n\n"
                 f"**Jira Ticket:** {key} - {summary}\n\n"
                 f"**Summary of changes:**\n{summary_text}\n\n"
-                f"**Review the proposed changes in this PR:** {pr.html_url}\n\n"
+                f"**Review the proposed changes in this PR:**\n{pr.html_url}\n\n"
                 f"If you have feedback or require changes, please comment here."
             )
             jira_comment_issue(key, comment)
