@@ -16,6 +16,10 @@ import requests
 from google.cloud import logging as gcp_logging
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
+from fastapi.responses import JSONResponse
+import tempfile
+import shutil
+import subprocess
 
 # Load environment variables from .env file
 load_dotenv()
@@ -602,6 +606,17 @@ def approve(req: ApprovalRequest):
                 base=DEFAULT_BRANCH
             )
             print(f"[DEBUG] Pull request created: {pr.html_url}")
+
+            # Run terraform checks and post results
+            repo_url = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{GITHUB_REPO}.git"
+            tf_results = run_terraform_checks(repo_url, branch_name)
+            tf_results_str = format_terraform_check_results(tf_results)
+            # Post as PR comment
+            pr.create_issue_comment(f"Terraform checks (init/validate/plan) results:\n\n{tf_results_str}")
+            # Optionally, post to Jira if user_id is a Jira ticket key
+            if re.match(r"^[A-Z]+-\d+$", req.user_id):
+                jira_comment_issue(req.user_id, f"Terraform checks (init/validate/plan) results:\n\n{tf_results_str}")
+
             return {"result": f"Pull request created: {pr.html_url}"}
         except Exception as e:
             print(f"[ERROR] Error creating PR: {e}")
@@ -626,8 +641,12 @@ def summarize(req: SummarizeRequest):
     summary = call_vertex_ai(prompt)
     return {"summary": summary.strip()}
 
-@app.post("/webhook/jira")
+# Temporarily allow GET for Jira webhook validation
+@app.api_route("/webhook/jira", methods=["POST", "GET"])
 async def jira_webhook(request: Request):
+    if request.method == "GET":
+        # TEMP: Allow GET for Jira webhook validation. Remove after webhook is saved.
+        return JSONResponse({"status": "ok"})
     print("[JIRA WEBHOOK] Endpoint hit!")
     import logging
     logger = logging.getLogger("jira-webhook")
@@ -736,6 +755,13 @@ async def jira_webhook(request: Request):
                 )
                 logger.info({"event": "pr_created", "key": parent_key, "pr_url": pr.html_url, "branch": branch_name})
                 print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
+                # Run terraform checks and post results
+                repo_url = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{GITHUB_REPO}.git"
+                tf_results = run_terraform_checks(repo_url, branch_name)
+                tf_results_str = format_terraform_check_results(tf_results)
+                pr.create_issue_comment(f"Terraform checks (init/validate/plan) results:\n\n{tf_results_str}")
+                jira_comment_issue(parent_key, f"Terraform checks (init/validate/plan) results:\n\n{tf_results_str}")
+                gcp_logging_client.logger("terraform-checks").log_text(f"Terraform checks for {parent_key} (sub-task {key}):\n{tf_results_str}")
                 # Move parent back to In Review and comment with summary and PR link
                 summary_text = None
                 try:
@@ -838,6 +864,13 @@ async def jira_webhook(request: Request):
             )
             logger.info({"event": "pr_created", "key": key, "pr_url": pr.html_url, "branch": branch_name})
             print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
+            # Run terraform checks and post results
+            repo_url = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{GITHUB_REPO}.git"
+            tf_results = run_terraform_checks(repo_url, branch_name)
+            tf_results_str = format_terraform_check_results(tf_results)
+            pr.create_issue_comment(f"Terraform checks (init/validate/plan) results:\n\n{tf_results_str}")
+            jira_comment_issue(key, f"Terraform checks (init/validate/plan) results:\n\n{tf_results_str}")
+            gcp_logging_client.logger("terraform-checks").log_text(f"Terraform checks for {key}:\n{tf_results_str}")
 
             # Move ticket to In Review and comment with summary and PR link
             summary_text = None
@@ -894,3 +927,53 @@ def clear_cache():
 def manual_generate_suggestions():
     generate_and_post_suggestions()
     return {"status": "manual suggestion generation triggered"}
+
+def run_terraform_checks(repo_url, branch_name, tf_dirs=None):
+    """
+    Clone the repo, checkout the branch, run terraform init/validate/plan in the 'terraform' directory only.
+    Returns a dict: {dir: {init: ..., validate: ..., plan: ...}}
+    """
+    results = {}
+    tempdir = tempfile.mkdtemp(prefix="tfcheck-")
+    try:
+        # Clone repo
+        subprocess.run(["git", "clone", repo_url, tempdir], check=True, capture_output=True)
+        subprocess.run(["git", "checkout", branch_name], cwd=tempdir, check=True, capture_output=True)
+        tf_dir = os.path.join(tempdir, "terraform")
+        if not os.path.isdir(tf_dir):
+            results["error"] = f"No 'terraform' directory found in repo root."
+            return results
+        res = {}
+        for cmd in ["init", "validate", "plan"]:
+            try:
+                if cmd == "plan":
+                    proc = subprocess.run(["terraform", cmd, "-no-color"], cwd=tf_dir, capture_output=True, timeout=120)
+                else:
+                    proc = subprocess.run(["terraform", cmd, "-no-color"], cwd=tf_dir, capture_output=True, timeout=60)
+                res[cmd] = proc.stdout.decode(errors="replace") + proc.stderr.decode(errors="replace")
+            except Exception as e:
+                res[cmd] = f"Error running terraform {cmd}: {e}"
+        results["terraform"] = res
+    except Exception as e:
+        results["error"] = str(e)
+    finally:
+        shutil.rmtree(tempdir)
+    return results
+
+def format_terraform_check_results(results):
+    if not results:
+        return "No terraform results."
+    if "error" in results:
+        return f"Error running terraform checks: {results['error']}"
+    out = []
+    for d, res in results.items():
+        out.append(f"### Terraform checks for `{d}`\n")
+        for cmd in ["init", "validate", "plan"]:
+            if cmd in res:
+                snippet = res[cmd]
+                if len(snippet) > 3000:
+                    snippet = snippet[:3000] + "\n... (truncated) ..."
+                out.append(f"**terraform {cmd}:**\n```")
+                out.append(snippet)
+                out.append("```")
+    return "\n\n".join(out)
